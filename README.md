@@ -33,7 +33,7 @@ By default, the consumer retrieves one message from the operator, processes it a
 ```python
 Consumer(
   {
-    'prefetch': 10, // this will process max. 10 messages at once when available
+    'prefetch': 10, # this will process max. 10 messages at once when available
   },
   handleMessage
 )
@@ -46,7 +46,7 @@ Should you ever need to unsubscribe your service from the operator programmatica
 ```python
 consumer = Consumer(...)
 
-''' later '''
+# later
 consumer.close()
 ```
 
@@ -60,19 +60,19 @@ The context provides helper methods to access previous operator results and also
 ### context api data retrieval
 
 ```python
-ctx.get_input()
+ctx.get_input(): Optional[Any]
 ```
 
 The input that was defined when the task started
 
 ```python
-ctx.get_meta()
+ctx.get_meta(): Optional[Any]
 ```
 
 The additional meta information added to the task
 
 ```python
-ctx.get_configuration(): unknown
+ctx.get_configuration(): Optional[Any]
 ```
 
 The optional configuration of the current service
