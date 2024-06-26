@@ -129,6 +129,14 @@ ctx.get_results(): Array[TypedDict{
 
 get results of all configured services in this task. When a service did run prior to the current service, `executionDate` and `error` or `data` will be available.
 
+
+```python
+ctx.get_tenant_name(): str
+```
+
+The name of the tenant that initiated the task
+
+
 ### context api processing control
 
 ```python
