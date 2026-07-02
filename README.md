@@ -1,181 +1,620 @@
 # requence
 
-This package connects python to the operator bus. It manages the retrieval and responses of messages.
+The official Python SDK for the Requence platform. This package covers both halves of the integration:
 
-## Usage
+- **`requence.service`** — connect a Python service to Requence and process messages
+- **`requence.task`** — start and monitor Requence tasks programmatically
 
-```python
-from requence.consumer import ContextHelper, Consumer
+## Requirements
 
-def handleMessage(context: ContextHelper):
-    return "this is my response"
+Python 3.12 or later.
 
-Consumer({}, handleMessage)
+## Installation
+
+```bash
+pip install requence
 ```
 
-Every consumer instance needs a `url` parameter to connect to the operator and a `version`. In the basic example, those parameters get automatically retrieved from environment variables `REQUENCE_URL` and `VERSION`.
-To be more explicit about those configurations, you can pass an object as the first parameter:
+---
+
+## Service
+
+A **service** is a program that connects to Requence, receives messages, processes them, and returns results. Services are the building blocks of every task template.
+
+### Authentication
+
+Every service needs an **access token**. Copy it from the **Services** list view in the Requence UI by clicking **Copy credentials**.
+
+The token is resolved in this order:
+
+1. `access_token` key in the config dict passed to `Service()`
+2. `REQUENCE_SERVICE_ACCESS_TOKEN` or `REQUENCE_ACCESS_TOKEN` environment variable
+3. `requence.service_access_token` or `requence.access_token` in `pyproject.toml`
+
+```bash
+REQUENCE_SERVICE_ACCESS_TOKEN=your-token python main.py
+```
+
+### Basic Usage
 
 ```python
-Consumer(
-  {
-    'url': 'your operator connection url string',
-    'version': 'your version in format major.minor.patch',
-  },
-  handleMessage
+from requence.service import Service
+
+def handler(ctx):
+    return {"message": f"Hello, {ctx.input['name']}!"}
+
+Service("1.0.0", handler)
+```
+
+The first argument is the **version** of the service definition you are implementing. The constructor blocks the current thread — Requence delivers messages, the handler runs, and results are sent back automatically.
+
+### Options object
+
+Instead of a bare version string, pass a config dict:
+
+```python
+from requence.service import Service
+
+def handler(ctx):
+    return process(ctx.input)
+
+Service(
+    {
+        "version": "1.0.0",
+        "prefetch": 5,         # process up to 5 messages in parallel (default: 1)
+        "access_token": "...", # overrides env / pyproject.toml
+        "ssl_context": ctx,    # optional ssl.SSLContext for TLS connections
+    },
+    handler,
 )
 ```
 
-## Additional configuration
+### Dev Overlay
 
-By default, the consumer retrieves one message from the operator, processes it and passes the response back to the operator. If your service is capable of processing multiple messages in parallel, you can define a higher `prefetch`.
+When developing locally alongside a deployed service, pass a **dev token** (your personal access token) so Requence routes only your own tasks to the local instance instead of the production pool:
 
 ```python
-Consumer(
-  {
-    'prefetch': 10, # this will process max. 10 messages at once when available
-  },
-  handleMessage
+import os
+from requence.service import Service
+
+def handler(ctx):
+    return ctx.input
+
+Service(
+    {"version": "1.0.0"},
+    handler,
+    dev_token=os.getenv("REQUENCE_DEV_TOKEN"),
 )
 ```
 
-## Unsubscribing service
+The dev token is resolved in the same order as the access token — `dev_token` argument → `REQUENCE_SERVICE_DEV_TOKEN` / `REQUENCE_DEV_TOKEN` env var → `requence.service_dev_token` / `requence.dev_token` in `pyproject.toml`.
 
-Should you ever need to unsubscribe your service from the operator programmatically, `Consumer` has a close method.
+### Closing the service
+
+`Service.__init__` blocks the current thread (it calls `channel.start_consuming()`). To stop consuming from another thread, call `close()`:
 
 ```python
-consumer = Consumer(...)
+import threading
+from requence.service import Service
 
-# later
-consumer.close()
+service = None
+
+def handler(ctx):
+    return ctx.input
+
+def run():
+    global service
+    service = Service("1.0.0", handler)
+
+thread = threading.Thread(target=run)
+thread.start()
+
+# Later, from another thread:
+service.close()
 ```
 
-To resubscribe, you have to instantiate a new `Consumer`
+---
 
-## Processing messages
+## Context API
 
-The message handler callback provides one argument: the message context.
-The context provides helper methods to access previous operator results and also methods to abort the processing early.
+Every handler receives a `ctx` object (a `Context` instance).
 
-### context api data retrieval
+### Data access
+
+| Attribute | Description |
+|---|---|
+| `ctx.input` | The input data routed to this service node |
+| `ctx.configuration` | The static configuration set on the node in the UI |
+| `ctx.task_id` | The unique ID of the current task execution |
+
+### Logging
+
+`ctx.debug` sends log messages to the Requence UI in real time:
 
 ```python
-ctx.get_input(): Optional[Any]
+def handler(ctx):
+    ctx.debug.log("Processing started")
+    ctx.debug.info("Step complete", {"step": 1})
+    ctx.debug.warn("Something looks off")
+    ctx.debug.error("An error occurred")
 ```
 
-The input that was defined when the task started
+### Flow control
+
+#### `ctx.retry(delay=None)`
+
+Instructs Requence to retry this service after an optional delay in milliseconds (minimum 100 ms). No code executes after this call.
 
 ```python
-ctx.get_meta(): Optional[Any]
+def handler(ctx):
+    db = get_db_connection()
+
+    if not db.is_connected:
+        ctx.retry(2000)  # retry in 2 seconds
+
+    return db.query("SELECT ...")
 ```
 
-The additional meta information added to the task
+> **Note:** It is your responsibility to prevent infinite retry loops.
+
+#### `ctx.abort(reason='')`
+
+Instructs Requence to abort this service immediately. If the service node's **on fail** output is not connected, the entire task fails.
 
 ```python
-ctx.get_configuration(): Optional[Any]
+def handler(ctx):
+    if not ctx.input.get("required_field"):
+        ctx.abort("Missing required field")
+
+    return process_data(ctx.input)
 ```
 
-The optional configuration of the current service
+#### `ctx.skip()`
+
+Puts the message back on the queue without processing it. The next available service instance will receive it.
+
+#### `ctx.to_output(output_name, value)`
+
+Routes the result to a specific **named output** on the service node. Use this when your service definition has multiple outputs:
 
 ```python
-ctx.get_service_meta(serviceIdentifier: str): TypedDict{
-    'executionDate': Optional[datetime], # null when the service was not yet executed
-  'id': str, // service id used for internal routing
-  'alias': Optional[str], # service alias (see service Identifier)
-  'name': str,
-  'configuration': Optional[Any],
-  'version': str
-}
+def handler(ctx):
+    if ctx.input.get("type") == "pdf":
+        return ctx.to_output("pdf", {"url": "..."})
+
+    return ctx.to_output("other", {"raw": ctx.input})
 ```
 
-The meta parameters of a service, usually not needed
+#### `ctx.defer(reason=None)`
+
+Marks the current message as **deferred**. The service acknowledges the message but signals that the result will be delivered later via `service.act()`. Returns a **message key**:
 
 ```python
-ctx.get_service_data(serviceIdentifier: str): Any
+def handler(ctx):
+    message_key = ctx.defer("waiting for external process")
+    save_to_db(ctx.task_id, message_key)
 ```
 
-The response of a previously executed service
+#### `ctx.terminated`
+
+A `threading.Event` that is set when the task is stopped — either cancelled via the UI or API, or terminated by another node. Use it in generator handlers to know when to stop:
 
 ```python
-ctx.get_last_service_data(serviceIdentifier: str): Any
+def handler(ctx):
+    while not ctx.terminated.is_set():
+        yield poll_for_updates()
+        ctx.terminated.wait(timeout=5)
 ```
 
-Same as `ctx.get_service_data` but only returns the last data when a service is used multiple times
+---
+
+## Continuous (Generator) Mode
+
+When a service node is configured in **continuous mode**, the handler can be a Python generator. Each `yield` sends an incremental result; the generator completing signals the end of processing:
 
 ```python
-ctx.get_service_error(serviceIdentifier: str): str | None
+from requence.service import Service
+
+def handler(ctx):
+    for chunk in fetch_chunks(ctx.input):
+        if ctx.terminated.is_set():
+            break
+        yield {"chunk": chunk}
+
+Service("1.0.0", handler)
 ```
 
-The error message of a previously executed service or null when said service was not yet executed or did process without error.
+The generator is stopped automatically when `ctx.terminated` is set. Any yielded values up to that point are still sent.
+
+---
+
+## Deferred Delivery via `service.act()`
+
+After deferring a message with `ctx.defer()`, deliver the result later — even from a different process — using the `act()` method on the `Service` instance:
 
 ```python
-ctx.get_last_service_error(serviceIdentifier: str): str | None
+from requence.service import Service
+
+service = None
+
+def handler(ctx):
+    message_key = ctx.defer()
+    save_to_db(ctx.task_id, message_key)
+
+service = Service("1.0.0", handler)  # blocks
 ```
 
-Same as `ctx.get_service_error` but only returns the last error when a service is used multiple times
-
 ```python
-ctx.get_results(): Array[TypedDict{
-  'executionDate': Optional[datetime], # null when the service was not yet executed
-  'id': str, # service id used for internal routing
-  'alias': Optional[str], # service alias (see service Identifier)
-  'name': str,
-  'configuration': Optional[Any],
-  'version': str
-  'error': Optional[str]
-  'data': Optional[Any]
-}]
+# In a webhook handler or background job:
+message_key = load_from_db(task_id)
+
+def actor(api):
+    api["send"]({"result": "done"})
+    # or: api["send_to_output"]("success", {"result": "done"})
+    # or: api["abort"]("something went wrong")
+
+service.act(message_key, actor)
 ```
 
-get results of all configured services in this task. When a service did run prior to the current service, `executionDate` and `error` or `data` will be available.
+The `actor` callable receives an `api` dict with three keys:
 
+| Key | Description |
+|---|---|
+| `api["send"](data)` | Send data to the default output |
+| `api["send_to_output"](name, data)` | Send data to a named output |
+| `api["abort"](error)` | Abort the deferred message with an error string or exception |
 
-```python
-ctx.get_tenant_name(): str
+The actor can also return a value or a generator directly, which behaves like calling `api["send"]()` for each value.
+
+---
+
+## CLI — `requence-service generate-types`
+
+The package installs a `requence-service` CLI that generates Python type stubs from the schemas you defined in the Requence UI:
+
+```bash
+requence-service generate-types
 ```
 
-The name of the tenant that initiated the task
+Type stubs are written to `typings/requence/service/`. Point your type checker at this directory to get type hints for `ctx.input`, `ctx.configuration`, and `ctx.to_output()`.
 
+### Options
 
-### context api processing control
+| Option | Default | Description |
+|---|---|---|
+| `--access-token` | — | Service access token (falls back to env / `pyproject.toml`) |
+| `--dev-token` | — | Personal access token for branch-specific types |
+| `--outdir` | `typings` | Directory to write the type stubs to |
+| `--watch` | `false` | Watch for schema changes and regenerate automatically |
+| `--clear` / `--no-clear` | `true` | Clear the terminal on watch updates |
 
-```python
-ctx.retry(delay: Optional[int]): None
+### Watch mode
+
+```bash
+requence-service generate-types --watch
 ```
 
-Instructs the operator to retry the service after an optional delay in milliseconds (minimum is 100ms). No code gets executed after this line.
-**Currently, it is your responsibility to prevent infinite loops.**
+The CLI connects via SSE and regenerates type stubs whenever a schema changes in the UI.
 
-```python
-ctx.abort(reason: Optional[str]): None
+---
+
+## Task
+
+Start and monitor Requence tasks programmatically.
+
+### Authentication
+
+The token is resolved in this order:
+
+1. `access_token` argument passed to `Task()`
+2. `REQUENCE_TASK_ACCESS_TOKEN` or `REQUENCE_ACCESS_TOKEN` environment variable
+3. `requence.task_access_token` or `requence.access_token` in `pyproject.toml`
+
+```bash
+REQUENCE_ACCESS_TOKEN=your-token python main.py
 ```
 
-Instructs the operator to abort the processing of this service immediately.
-If the service is not configured with a fail over, the complete task will fail.
-
-### service identifier
-
-Most context methods require a service identifier as parameter. This identifier can either be a service name or a service alias. The latter is useful for situations where a service is used multiple times in a task and needs the data from one specific execution.
-
-## Full example
-
-Pseudo implementation of a database service
+### Basic Usage
 
 ```python
-from requence.consumer import ContextHelper, Consumer
-from someDb import db
+from requence.task import Task
 
-def handleMessage(context: ContextHelper):
-    ocrData = ctx.get_service_data("ocr")
+task = Task(task_template="my-template", input={"name": "World"})
+result = task.sync.result  # Blocks until the task completes
 
-    if (not ocrData):
-      ctx.abort("Ocr service is mandatory for this AI service")
+print(result["result"])    # The final output of the task
+```
 
-    if (not db.isConnected):
-        # lets wait 2s for the db to recover
-        ctx.retry(2000)
+### `Task` constructor options
 
-    response = db.getDataBasedOnOcr(ocrData)
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `task_template` | `str` | — | **Required.** Name of the task template |
+| `input` | `dict` | `{}` | Input data (required when the template defines an input schema) |
+| `name` | `str` | `None` | Human-readable task name shown in the UI |
+| `priority` | `int` | `2` | Priority `0` (lowest) to `4` (highest) |
+| `access_token` | `str` | `None` | Access token (falls back to env / `pyproject.toml`) |
+| `require_ack` | `bool` | `False` | Enable delivery guarantee (see below) |
+| `suppress_branch_warning` | `bool` | `False` | Suppress the branch warning on non-live branches |
 
-    return response
+### Synchronous access via `task.sync`
+
+`task.sync` exposes blocking accessors — useful in standard synchronous code:
+
+```python
+task = Task(task_template="my-template", input={})
+
+task_id = task.sync.id       # Blocks until the task is created
+task_url = task.sync.url     # URL to view the task in the Requence UI
+result = task.sync.result    # Blocks until the task completes
+```
+
+#### Awaiting finalization (cheap monitoring)
+
+`task.sync.finalized()` blocks only until the task passes input validation and is created on the backend — without starting full SSE monitoring:
+
+```python
+from requence.exceptions import TaskException
+
+try:
+    task_id = task.sync.finalized()
+    print(f"Task {task_id} is running in the background")
+except TaskException as e:
+    print("Validation failed:", e)
+```
+
+### Async access
+
+`Task` also exposes async-compatible properties:
+
+```python
+task_id = await task.task_id
+task_url = await task.task_url
+result = await task.result
+task_id = await task.finalized()
+```
+
+### Aborting and protecting
+
+```python
+task.abort("No longer needed")
+task.protect()  # Exclude from automatic cleanup
+```
+
+### Standalone helpers
+
+```python
+from requence.task import abort_task, protect_task
+
+abort_task(task_id="some-task-id", reason="Cancelled by user")
+protect_task(task_id="some-task-id")
+```
+
+### Result object
+
+When `task.sync.result` (or `await task.result`) resolves, it returns a `TaskResult` dict:
+
+```python
+result["task_id"]                      # Unique task identifier
+result["task_url"]                     # URL to view the task in the Requence UI
+result["input"]                        # The input you provided
+result["result"]                       # The final task output
+result["node_data"]["my_alias"]        # Output from a specific node by alias
+result["node_error"]["my_alias"]       # Error from a specific node by alias
+```
+
+---
+
+## Streaming Updates
+
+### Synchronous iteration
+
+```python
+from requence.task import Task
+
+task = Task(task_template="my-template", input={"data": [1, 2, 3]})
+
+for update in task.sync.updates:
+    match update["type"]:
+        case "taskStart":
+            print(f"Task {update['taskId']} started")
+        case "nodeStart":
+            node = update["node"]
+            print(f"Node {node.get('alias', node['id'])} started")
+        case "nodeUpdate":
+            print("Node output:", update["data"])
+        case "nodeError":
+            print("Node error:", update["error"])
+        case "nodeDefer":
+            print("Node deferred:", update.get("reason"))
+        case "taskEnd":
+            print("Task completed:", update["context"]["result"])
+        case "taskError":
+            print("Task failed:", update.get("reason"))
+        case "taskAborted":
+            print("Task aborted:", update.get("reason"))
+```
+
+### Async iteration
+
+```python
+async for update in task.updates:
+    print(update["type"], update["context"]["task_id"])
+```
+
+### Update types
+
+| Type | Description |
+|---|---|
+| `taskStart` | Task execution has begun. Contains `input` and `taskId`. |
+| `nodeStart` | A node started processing. Contains `node` info (id, type, alias). |
+| `nodeUpdate` | A node produced output. Contains `data` and `output` (named output, if any). |
+| `nodeError` | A node encountered an error. Contains `error` message. |
+| `nodeDefer` | A node has been deferred (waiting for an external callback). |
+| `nodeEnd` | A node finished processing. |
+| `taskEnd` | The task completed successfully. Contains final `result`. |
+| `taskError` | The task failed. Contains `reason`. |
+| `taskAborted` | The task was aborted. Contains `reason`. |
+
+### Context on every update
+
+Every update includes a `context` dict with the current accumulated state:
+
+```python
+update["context"]["task_id"]                   # The task ID
+update["context"]["input"]                     # The task input
+update["context"]["result"]                    # Accumulated result (partial until taskEnd)
+update["context"]["node_data"]["my_alias"]     # Output from a specific node
+update["context"]["node_error"]["my_alias"]    # Error from a specific node
+```
+
+---
+
+## Fetching a Task by ID
+
+Retrieve the current state of any task:
+
+```python
+from requence.task import get_task
+
+status, context = get_task("some-task-id")
+# or: get_task("some-task-id", access_token="...")
+
+# status: 'successful' | 'failed' | 'idle' | 'pending' | 'running' | 'stopped'
+print(status)
+print(context["input"])
+print(context["result"])
+print(context["node_data"].get("my_alias"))
+print(context["node_error"].get("my_alias"))
+```
+
+---
+
+## Watching All Tasks (`TaskWatcher`)
+
+Subscribe to real-time updates across **all tasks** — useful for dashboards, monitoring systems, or audit logs.
+
+```python
+from requence.task import TaskWatcher
+from datetime import datetime
+
+watcher = TaskWatcher(since=datetime.now())
+
+# Synchronous iteration
+for update, incomplete in watcher.sync().updates:
+    print(f"[{update['type']}] Task {update['context']['task_id']}")
+    print("Incomplete (joined mid-task):", incomplete)
+```
+
+```python
+# Async iteration
+async for update, incomplete in watcher.updates:
+    print(update["type"])
+```
+
+Call `watcher.stop()` to disconnect:
+
+```python
+watcher.stop()
+```
+
+### `TaskWatcher` options
+
+| Parameter | Type | Description |
+|---|---|---|
+| `since` | `date` | **Required.** Only receive updates after this timestamp. |
+| `access_token` | `str` | Access token (falls back to env / `pyproject.toml`) |
+| `on_connect` | `callable` | Called when the connection is established |
+
+### Incomplete flag
+
+Each update tuple from `TaskWatcher` includes an `incomplete` boolean. When `True`, it means the watcher connected after the task had already started — the `taskStart` event was missed. Use this to decide whether to skip or partially process the update.
+
+### Delivery Guarantee
+
+When a task is started with `require_ack=True`, `TaskWatcher` automatically ACKs the terminal event (`taskEnd`, `taskError`, `taskAborted`) as soon as it is received — no extra code required.
+
+---
+
+## Delivery Guarantee
+
+By default, a task transitions immediately to its final status when it finishes. If the process that started the task crashes at the exact moment the terminal event is emitted, the event can be lost.
+
+Setting `require_ack=True` enables an explicit acknowledgement step:
+
+1. When the task finishes the backend holds it in **`AWAITING_DELIVERY`** instead of immediately finalising.
+2. The SDK receives the terminal event and automatically sends an ACK back.
+3. Only after the ACK is received does the task move to its real final status.
+
+```python
+task = Task(
+    task_template="my-template",
+    input={},
+    require_ack=True,
+)
+
+result = task.sync.result  # Only resolves after the ACK has been confirmed
+```
+
+---
+
+## CLI — `requence-task generate-types`
+
+The package installs a `requence-task` CLI that generates Python type stubs from the task template schemas defined in the Requence UI:
+
+```bash
+requence-task generate-types
+```
+
+Type stubs are written to `typings/requence/task/`. Point your type checker at this directory to get type hints for task inputs and results.
+
+### Options
+
+| Option | Default | Description |
+|---|---|---|
+| `--access-token` | — | Access token (falls back to env / `pyproject.toml`) |
+| `--outdir` | `typings` | Directory to write the type stubs to |
+
+---
+
+## Full Example — Service
+
+```python
+from requence.service import Service
+from my_db import db
+
+def handler(ctx):
+    if not db.is_connected:
+        ctx.retry(2000)  # wait 2s for the DB to recover
+
+    if not ctx.input.get("ocr_data"):
+        ctx.abort("OCR data is mandatory")
+
+    result = db.get_data_based_on_ocr(ctx.input["ocr_data"])
+    return result
+
+Service({"version": "1.2.3", "prefetch": 2}, handler)
+```
+
+## Full Example — Task
+
+```python
+from requence.task import Task
+from requence.exceptions import TaskException
+
+task = Task(
+    task_template="invoice-processing",
+    input={"invoice_url": "https://..."},
+    name="Invoice #1234",
+    priority=3,
+)
+
+task_id = task.sync.id
+print("Started task:", task_id)
+
+try:
+    result = task.sync.result
+    print("Final result:", result["result"])
+except TaskException as e:
+    print("Task failed:", e)
 ```
