@@ -276,7 +276,32 @@ The package installs a `requence-service` CLI that generates Python type stubs f
 requence-service generate-types
 ```
 
-Type stubs are written to `typings/requence/service/`. Point your type checker at this directory to get type hints for `ctx.input`, `ctx.configuration`, and `ctx.to_output()`.
+Type stubs are written to `typings/requence/service/`. Pylance and pyright read a top-level `typings/` directory automatically, so no extra configuration is needed. (If you pass a custom `--outdir`, point your type checker's stub path at it — e.g. `python.analysis.stubPath` for Pylance.)
+
+### Using the generated types
+
+Unlike TypeScript — where the `createService` callback is typed automatically — a Python type checker **cannot** infer the type of a named handler's parameter from the `Service(...)` call. Import the type for your service version and annotate the handler's `ctx` parameter:
+
+```python
+from requence.service import Service
+from requence.service.types import some_types  # one class per service version
+
+def handler(ctx: some_types.context) -> some_types.output:
+    name = ctx.input["name"]        # typed from the version's input schema
+    return {"number": 10}           # checked against the version's output schema
+
+Service("some-types", handler)      # the version string is validated too
+```
+
+The class name is your service version with every character that isn't a letter or digit replaced by `_`, and a leading `v` added if it starts with a digit — e.g. `some-types` → `some_types`, `1.2.3` → `v1_2_3`.
+
+- **`ctx: <version>.context`** types `ctx.input`, `ctx.configuration`, and `ctx.to_output()`.
+- **`-> <version>.output`** is required when you `return` an output dict literal directly (without it the checker infers a plain `dict` that won't match the output schema). You can omit it if you return through `ctx.to_output(...)`, whose return type already matches.
+- For a trivial one-liner you can skip both the import and the annotation with a lambda, which the type checker types contextually:
+
+  ```python
+  Service("some-types", lambda ctx: {"number": 10})  # ctx is fully typed
+  ```
 
 ### Options
 
@@ -566,7 +591,7 @@ The package installs a `requence-task` CLI that generates Python type stubs from
 requence-task generate-types
 ```
 
-Type stubs are written to `typings/requence/task/`. Point your type checker at this directory to get type hints for task inputs and results.
+Type stubs are written to `typings/requence/task/`, giving you type hints for task inputs and results. As with the service stubs, Pylance and pyright read a top-level `typings/` directory automatically (point your stub path at a custom `--outdir` otherwise).
 
 ### Options
 
