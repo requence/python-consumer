@@ -69,6 +69,16 @@ Service(
 )
 ```
 
+For `amqps://` connections, TLS settings can also be overridden with
+environment variables (a **fallback** — a passed `ssl_context` takes
+precedence):
+
+| Variable              | Effect                                                               |
+| --------------------- | -------------------------------------------------------------------- |
+| `CA`                  | Inline PEM certificate(s) to trust as the CA.                        |
+| `CA_FILE`             | Path to a PEM file to trust as the CA (`CA` wins when both are set). |
+| `REJECT_UNAUTHORIZED` | Set to `false`/`0`/`no` to disable certificate verification.         |
+
 ### Dev Overlay
 
 When developing locally alongside a deployed service, pass a **dev token** (your personal access token) so Requence routes only your own tasks to the local instance instead of the production pool:
