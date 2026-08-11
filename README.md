@@ -99,29 +99,48 @@ Service(
 
 The dev token is resolved in the same order as the access token — `dev_token` argument → `REQUENCE_SERVICE_DEV_TOKEN` / `REQUENCE_DEV_TOKEN` env var → `requence.service_dev_token` / `requence.dev_token` in `pyproject.toml`.
 
-### Closing the service
+### Two ways to start — and why it matters
 
-`Service.__init__` blocks the current thread (it calls `channel.start_consuming()`). To stop consuming from another thread, call `close()`:
+`Service(...)` configures the service and then **consumes on the calling thread**, so it never returns while the service is up:
+
+```python
+from requence.service import Service
+
+Service("1.0.0", lambda ctx: ctx.input)   # blocks here forever
+```
+
+That is the right shape when the service is the whole program. But it means there is **no instance to call methods on** — so `act()` and `close()`, which are both methods, are out of reach. Use `Service.start(...)` when you need either. It is the same configuration with the consume loop on a thread of its own, and it **returns the instance** once connected:
 
 ```python
 import threading
 from requence.service import Service
 
-service = None
+service = Service.start("1.0.0", lambda ctx: ctx.input)
+# ...connected; `service` is usable here
 
-def handler(ctx):
-    return ctx.input
+threading.Event().wait()   # keep the main thread alive; see below
+```
 
-def run():
-    global service
-    service = Service("1.0.0", handler)
+| | `Service(...)` | `Service.start(...)` |
+|---|---|---|
+| Returns | never (while up) | once connected |
+| `act()` / `close()` | unreachable | usable |
+| Bad credentials | raises | raises |
+| Consume thread | the caller's | a daemon thread |
 
-thread = threading.Thread(target=run)
-thread.start()
+`start(..., timeout=30.0)` bounds only the **first** connect; every drop after it reconnects in the background as always. A first connect that never lands raises `TimeoutError` and stops retrying, so you never get back an instance you cannot use.
 
-# Later, from another thread:
+Its consume thread is a **daemon**, so it never holds the process open. If the service is the whole program, keep the main thread alive yourself — a `threading.Event().wait()`, a web server, a REPL — or just use the blocking `Service(...)`.
+
+### Closing the service
+
+```python
+service = Service.start("1.0.0", handler)
+# ...later, from anywhere:
 service.close()
 ```
+
+`close()` stops consuming and stops reconnecting. It is safe to call from any thread: the channel work is marshalled onto the connection's own thread.
 
 ---
 
@@ -240,18 +259,18 @@ The generator is stopped automatically when `ctx.terminated` is set. Any yielded
 
 ## Deferred Delivery via `service.act()`
 
-After deferring a message with `ctx.defer()`, deliver the result later — even from a different process — using the `act()` method on the `Service` instance:
+After deferring a message with `ctx.defer()`, deliver the result later — even from a different process — using the `act()` method on the `Service` instance.
+
+**Start the service with `Service.start(...)`**, not `Service(...)`: `act()` is a method, and the blocking constructor never returns the object to call it on.
 
 ```python
 from requence.service import Service
-
-service = None
 
 def handler(ctx):
     message_key = ctx.defer()
     save_to_db(ctx.task_id, message_key)
 
-service = Service("1.0.0", handler)  # blocks
+service = Service.start("1.0.0", handler)   # returns
 ```
 
 ```python
@@ -266,6 +285,8 @@ def actor(api):
 service.act(message_key, actor)
 ```
 
+`act()` may be called from any thread — a web request handler, a scheduler, a durable surface handler. It publishes through the connection's own thread and does not return until everything it published has actually gone out, so a script that calls `act()` and then exits does not lose the answer.
+
 The `actor` callable receives an `api` dict with three keys:
 
 | Key | Description |
@@ -273,8 +294,226 @@ The `actor` callable receives an `api` dict with three keys:
 | `api["send"](data)` | Send data to the default output |
 | `api["send_to_output"](name, data)` | Send data to a named output |
 | `api["abort"](error)` | Abort the deferred message with an error string or exception |
+| `api["render"](ui, props, surface_id=…)` | Draw or redraw a surface on the deferred node — see [Surfaces](#surfaces--a-ui-of-your-own-on-the-node) |
 
 The actor can also return a value or a generator directly, which behaves like calling `api["send"]()` for each value.
+
+---
+
+## Surfaces — a UI of your own on the node
+
+A service can ship its own UI component and have Requence render it **on the
+publishing node** in the task canvas. There is no UI protocol: the contract is
+**props**, and a callable inside them arrives in the component as an invokable
+function.
+
+The design authority is
+[`knowledge/service-ui-surfaces.md`](../knowledge/service-ui-surfaces.md); this
+section is the Python API. The TypeScript SDK
+(`packages/service/README.md`) is the reference for behaviour — the wire is
+identical, and a Python service and a TS service draw the same surfaces.
+
+**The one difference is the typing of the props, not the behaviour.**
+`create_ui[Props]` and `RequenceUI[Props]` take a type parameter, but
+`ctx.render(ui, props)` accepts `Any`: a wrong prop name or a wrong value type is a
+runtime concern here, where TypeScript catches it against `Partial<Props>`. There is
+also no type bridge between the service and the component — no `PropsOf`, no
+`createSurface` — because a component is always a built JavaScript module (see
+below), so its props are declared in TypeScript on the component's side and in
+Python on the service's side, and keeping the two in step is yours. Everything else
+in this section behaves exactly as the TS README describes it.
+
+```python
+from pathlib import Path
+from requence.service import Service, create_ui
+
+ui = create_ui(
+    # An ABSOLUTE path to the BUILT component. `Path(__file__).parent / …`
+    # resolves against this module, not against whatever directory the service was
+    # started from.
+    Path(__file__).parent / "dist" / "panel.js",
+    # Optional default props: what does not change from one message to the next.
+    {"dense": True},
+)
+
+def handler(ctx):
+    ctx.render(ui, {"title": "Processing"})
+    return ctx.input
+
+Service("1.0.0", handler)
+```
+
+**Requence never bundles.** The component is always a built JavaScript ES module
+with one default `mount(element, ctx)` export, whatever language the service is
+written in — build it with your own JS toolchain and point `create_ui` at the
+result. The bundle is read and hashed once, at import time, and capped at 1 MiB,
+so an oversized component fails at startup rather than on its first render in
+production.
+
+### `create_ui(path, defaults=None, *, id=None)`
+
+| Argument | Meaning |
+|---|---|
+| `path` | Absolute path (`str` or `PathLike`) to the built module. A relative path or a URL is refused — the first resolves against the working directory, and Requence reads the component's bytes rather than fetching them. |
+| `defaults` | Props restated on every render of this component. Copied one level deep. |
+| `id` | The component's **stable id**, defaulting to the built file's name. |
+
+The id is what a durable handler is addressed by, and it is the one thing about a
+component a rebuild leaves alone — the content hash deliberately does not. Two
+handles claiming one id raise at import time, so two `index.js`-shaped components,
+or one file registered twice with different defaults, need explicit ids.
+
+### `ctx.render(ui, props, *, surface_id="default")`
+
+Fire-and-forget, like a data send: the publish is enrolled in the message's ledger,
+so a failure fails the node at the settle gate rather than at the call site.
+
+**A render is a patch.** What the surface shows is the *fold* of three layers — the
+UI's defaults, everything previously rendered onto that surface, and this render —
+so redrawing one field takes one prop and leaves the rest standing:
+
+```python
+ctx.render(ui, {"title": "Processing", "at": now()})
+ctx.render(ui, {"at": now()})       # still says "Processing"
+ctx.render(ui, {"title": "Done"})   # and still carries the last `at`
+```
+
+The merge is **shallow**, and nothing is ever removed — an omitted prop means
+"nothing to say about this", so a prop is taken back by saying something else about
+it (`{"error": None}`). Defaults are the **weakest** layer: they are what a surface
+shows until some render says otherwise.
+
+`surface_id` names which surface on the node this render targets; one node can
+carry several.
+
+**Prop names are the component's, not Python's.** The props are a wire contract with
+a built JavaScript module, so they stay in whatever case that module reads —
+`onSubmit`, not `on_submit`. Nothing here renames anything, in either direction, and
+the same is true of the argument an interaction comes back with: the component decides
+what it sends, and the handler receives exactly that.
+
+### Handler props — where you write the callable decides how long it can be pressed
+
+A callable in a surface's props arrives in the component as an invokable function.
+There are **two kinds**, and you pick by *where you write it*:
+
+```python
+def on_submit(answer):
+    # DURABLE. Module scope, so any instance of this version can run it — this one,
+    # or the one that replaces it in a redeploy. An invocation waits in the
+    # version's handler queue for ~60s, so the handler below is free to return, and
+    # a rolling restart is invisible to the viewer.
+    record(answer)
+
+ask_ui = create_ui(HERE / "dist" / "ask.js", {"onSubmit": on_submit})
+
+def handler(ctx):
+    ctx.render(ask_ui, {
+        "question": "ship it?",
+        # CONNECTION-BOUND. Closes over this running handler, so only this process
+        # can serve it and it dies when the message settles — which is also why it
+        # needs a generator handler.
+        "onCancel": lambda _arg: ctx.debug.log("cancelled"),
+    })
+    yield from ()
+```
+
+A **non-generator** handler may not declare a callable in a render's props: its
+registry goes the moment it returns, so the reference would be dead on arrival. It
+raises with that message and names the fix. A callable in the UI's **defaults** is
+durable and registers nothing, so a non-generator handler can publish one freely.
+
+A durable handler gets **no injected context**: it reaches its own stores and
+anything else through its own closure, exactly as a module-scope function would in
+any other process of the version. Consuming the handler queue is automatic — it is
+`service-<name>@<version>-handlers`, one per version, created by Requence when the
+version is provisioned and declared again by the SDK on connect.
+
+**A durable handler outlives its message, not its task.** The rule the browser
+applies per prop is:
+
+```
+reachable(durable)    = the task is running  AND some instance of the version is up
+reachable(connection) = …and this surface's connection is alive with the message unsettled
+```
+
+So if the handler that rendered simply **returns**, the node completes, the task goes
+terminal, and the button is correctly reported unreachable and disabled within
+seconds — the surface stays, but there is nothing behind it. A handler that wants its
+controls to keep working calls `ctx.defer(...)`, which settles the message (so no
+connection-bound prop can survive it) and leaves the task running:
+
+```python
+def handler(ctx):
+    ctx.defer("waiting for a click")
+    ctx.render(ask_ui, {"question": "ship it?"})
+    # returns here; the process may now exit and the button still works
+```
+
+The argument comes from the **browser** and is forgeable: validate it in the
+handler, and keep anything the handler must not be told in its closure rather than
+in the props. An interaction is *accepted*, not awaited, so a click carries no
+result — feedback is a re-render.
+
+**A thrown handler is visible.** Whatever went wrong — an unregistered component, a
+prop holding nothing invokable, a handler that raised — is recorded on the surface
+and rendered by Requence beneath the frame, and the invocation is **acked** either
+way (a requeue would rerun a side-effecting handler forever).
+
+### Component reload in a dev session
+
+A service connected with a **dev token** watches the built file behind every
+`create_ui`. Rebuild it and the frame swaps to the new bundle in place — same
+props, same handlers, same node, no re-render and no new task. It reaches every
+surface your dev session ever drew and nothing else, so a production surface of
+the same component is untouched. Saving the file without changing its content
+swaps nothing, and a rebuild over the 1 MiB cap is refused with a warning while
+the previous bundle stays live.
+
+The watch is a poll (one `stat` per registered component every 200 ms) rather than
+a filesystem-event subscription, so the SDK grows no runtime dependency for a
+dev-only feature. It runs on one daemon thread, never holds the process open, and
+an unwatchable path degrades the loop to a warning — you still get a rebuild on
+restart.
+
+### The deferred form, end to end
+
+A durable handler answering the node it was rendered on is the shape all of this is
+for. It needs `Service.start(...)`, because the handler is at module scope and has to
+reach the instance:
+
+```python
+def on_submit(arg):
+    # Durable: module scope, so any instance of this version can run it. The defer
+    # key came out in the props and comes back in the argument.
+    def actor(api):
+        api["render"](ui, {"submitted": True})   # before the send: act() settles it
+        api["send"]({"answer": arg["answer"]})
+
+    service.act(arg["deferKey"], actor)
+
+ui = create_ui(HERE / "dist" / "ask.js", {"onSubmit": on_submit})
+
+def handler(ctx):
+    # Defer FIRST: there is no key until the message is parked, and deferring is
+    # what keeps the task running so the button stays reachable.
+    ctx.render(ui, {"question": "ship it?", "deferKey": ctx.defer("waiting")})
+
+service = Service.start({"version": "1.0.0"}, handler)
+threading.Event().wait()
+```
+
+Kill the process afterwards and the form still works: answering it runs the handler
+in whichever instance of the version is free at the time, and an invocation with none
+running waits in the version's handler queue. Requence holds nothing.
+
+The argument is the **browser's** and forgeable — the `deferKey` above included. That
+is safe because a key is single-use, belongs to that task's own node, and `act()`
+refuses anything else. A handler acting on a viewer-supplied amount, id or address
+must validate it, and anything the handler must not be told belongs in its closure
+rather than in the props.
+
+`test/demo-service/surface_demo.py` is this, runnable.
 
 ---
 
