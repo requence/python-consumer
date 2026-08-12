@@ -257,6 +257,72 @@ The generator is stopped automatically when `ctx.terminated` is set. Any yielded
 
 ---
 
+## Callbacks — functions you emit alongside your data
+
+A callable in what a service emits arrives downstream as a function the graph may
+call back. There are **two kinds**, and — as with a surface's handler props — you
+pick by *where you write it*: inline in the handler ⇒ **connection-bound**, declared
+at module scope ⇒ **durable**.
+
+The TypeScript SDK (`packages/service/README.md`) is the reference for that
+behaviour and for every rule around it — what a durable callback is handed and what
+it is not, what a binding may not be, the per-version queue and its TTL, the pile-up
+warning and its thresholds, and the gaps. The design authority is
+[`knowledge/durable-callbacks.md`](../knowledge/durable-callbacks.md). The wire is
+identical: a Python service and a TS service emit the same references. This section
+is the Python API and the places it differs.
+
+```python
+from requence.service import Service, create_durable_callback
+
+# DURABLE. Declared ONCE at module scope, addressed by the name it is given.
+# It closes over nothing per email, so any instance of this version can run it —
+# this one, or the one that replaces it in a redeploy.
+delete_mail = create_durable_callback(
+    "deleteMail",
+    lambda _arg, context: delete(context["configuration"], context["uid"]),
+)
+
+def handler(ctx):
+    for mail in mails:
+        yield {
+            "subject": mail.subject,
+            # a reference, not a closure: the registry holds one callback, not one
+            # per email.
+            "delete": delete_mail.for_({"uid": mail.uid}),
+            # CONNECTION-BOUND. Needs the LIVE imap client, so it correctly dies
+            # with this message — and holds everything it captured until then.
+            "stream": lambda _arg: imap.download(mail.uid),
+        }
+```
+
+A declaration with nothing to bind is emitted as itself — `.for_()` is optional
+there:
+
+```python
+acknowledge = create_durable_callback("acknowledge", lambda _arg, _ctx: ack())
+
+yield {"subject": mail.subject, "acknowledge": acknowledge}
+```
+
+### Differences from the TypeScript SDK
+
+Both SDKs speak one wire contract; three things cannot be shared.
+
+- **`.for_(…)`, not `.for(…)`.** `for` is a reserved word in Python, and PEP 8's
+  trailing underscore is the convention for exactly this clash. It is the only place
+  the two SDKs deliberately differ in spelling.
+- **The handler's context is a mapping**, read by key — `context["uid"]`,
+  `context["configuration"]` — where TypeScript destructures an object. It holds the
+  same two things and the same reserved key.
+- **No typing of the argument, the binding or the configuration.** TypeScript gets
+  all three from `createDurableCallback<Arg, Bound, 'version'>` and refuses a
+  declaration emitted without its binding at compile time. In Python `arg` and
+  `context` are plain values: the reserved-key and non-dict checks raise at
+  `.for_(…)`, and everything else is yours to validate.
+
+---
+
 ## Deferred Delivery via `service.act()`
 
 After deferring a message with `ctx.defer()`, deliver the result later — even from a different process — using the `act()` method on the `Service` instance.
