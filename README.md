@@ -38,7 +38,7 @@ REQUENCE_SERVICE_ACCESS_TOKEN=your-token python main.py
 ## Your first service
 
 Create the service in the Requence UI first — its input schema, configuration schema and
-outputs. Then implement the version:
+outputs. Then implement the variant:
 
 ```python
 from requence.service import Service
